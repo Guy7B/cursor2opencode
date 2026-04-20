@@ -70,6 +70,13 @@ TOOL_PREVIEW_FIELDS = [
 
 
 # ---------------------------------------------------------------------------
+# Default model for imported sessions
+# ---------------------------------------------------------------------------
+
+IMPORT_PROVIDER_ID = "anthropic"
+IMPORT_MODEL_ID = "imported-from-cursor"
+
+# ---------------------------------------------------------------------------
 # ID generation
 # ---------------------------------------------------------------------------
 
@@ -77,6 +84,23 @@ def generate_id(prefix: str, seed: str) -> str:
     """Generate a deterministic ID with a given prefix, seeded by input string."""
     h = hashlib.sha256(seed.encode()).hexdigest()[:24]
     return "{}_{}".format(prefix, h)
+
+
+def generate_sortable_id(prefix: str, time_ms: int, sequence: int, seed: str) -> str:
+    """
+    Generate a deterministic ID that sorts chronologically.
+
+    OpenCode stores parts ordered by (message_id, id). Native IDs embed a
+    timestamp so they sort in creation order. We replicate this by putting
+    a hex-encoded timestamp + sequence at the front, followed by a short
+    deterministic hash for uniqueness.
+
+    Format: {prefix}_{12-hex-time}{2-hex-seq}{10-hex-hash}  (24 chars after _)
+    """
+    time_hex = format(time_ms % (1 << 48), "012x")
+    seq_hex = format(sequence % 256, "02x")
+    h = hashlib.sha256(seed.encode()).hexdigest()[:10]
+    return "{}_{}{}{}".format(prefix, time_hex, seq_hex, h)
 
 
 # ---------------------------------------------------------------------------
@@ -207,13 +231,13 @@ def make_user_msg(
     session_id: str, msg_id: str, text: str, time_ms: int,
 ) -> dict:
     """Build an OpenCode user message."""
-    part_id = generate_id("prt", "{}-text".format(msg_id))
+    part_id = generate_sortable_id("prt", time_ms, 0, "{}-user-text".format(msg_id))
     return {
         "info": {
             "role": "user",
             "time": {"created": time_ms},
             "agent": "build",
-            "model": {"providerID": "cursor", "modelID": "cursor-agent"},
+            "model": {"providerID": IMPORT_PROVIDER_ID, "modelID": IMPORT_MODEL_ID},
             "summary": {"diffs": []},
             "id": msg_id,
             "sessionID": session_id,
@@ -248,8 +272,8 @@ def make_asst_info(
             "total": 0, "input": 0, "output": 0, "reasoning": 0,
             "cache": {"write": 0, "read": 0},
         },
-        "modelID": "cursor-agent",
-        "providerID": "cursor",
+        "modelID": IMPORT_MODEL_ID,
+        "providerID": IMPORT_PROVIDER_ID,
         "time": {"created": time_ms, "completed": time_ms + 100},
         "finish": finish,
         "id": msg_id,
@@ -267,7 +291,7 @@ def make_text_separator(
         "parts": [
             {
                 "type": "step-start",
-                "id": generate_id("prt", "{}-start".format(msg_id)),
+                "id": generate_sortable_id("prt", time_ms, 0, "{}-sep-start".format(msg_id)),
                 "sessionID": session_id,
                 "messageID": msg_id,
             },
@@ -275,7 +299,7 @@ def make_text_separator(
                 "type": "text",
                 "text": text,
                 "time": {"start": time_ms, "end": time_ms + 100},
-                "id": generate_id("prt", "{}-text".format(msg_id)),
+                "id": generate_sortable_id("prt", time_ms, 1, "{}-sep-text".format(msg_id)),
                 "sessionID": session_id,
                 "messageID": msg_id,
             },
@@ -287,7 +311,7 @@ def make_text_separator(
                     "cache": {"write": 0, "read": 0},
                 },
                 "cost": 0,
-                "id": generate_id("prt", "{}-finish".format(msg_id)),
+                "id": generate_sortable_id("prt", time_ms, 2, "{}-sep-finish".format(msg_id)),
                 "sessionID": session_id,
                 "messageID": msg_id,
             },
@@ -313,6 +337,7 @@ def convert_line(
     parent_msg_id: str,
     line_index: int,
     base_time_ms: int,
+    working_dir: str = "",
 ) -> list:
     """
     Convert a single Cursor JSONL line into OpenCode messages.
@@ -324,7 +349,7 @@ def convert_line(
     content_parts = line_data.get("message", {}).get("content", [])
 
     msg_time_ms = base_time_ms + (line_index * 1000)
-    msg_id = generate_id("msg", "{}-{}".format(session_id, line_index))
+    msg_id = generate_sortable_id("msg", msg_time_ms, 0, "{}-{}".format(session_id, line_index))
 
     if role == "user":
         user_text = extract_user_text(content_parts)
@@ -337,14 +362,16 @@ def convert_line(
     tool_calls = extract_tool_calls(content_parts)
 
     parts = []  # type: List[dict]
+    part_seq = 0  # monotonic sequence counter for sortable part IDs
 
     # Step start
     parts.append({
         "type": "step-start",
-        "id": generate_id("prt", "{}-{}-start".format(session_id, line_index)),
+        "id": generate_sortable_id("prt", msg_time_ms, part_seq, "{}-{}-start".format(session_id, line_index)),
         "sessionID": session_id,
         "messageID": msg_id,
     })
+    part_seq += 1
 
     # Text part
     if assistant_text.strip():
@@ -352,10 +379,11 @@ def convert_line(
             "type": "text",
             "text": assistant_text,
             "time": {"start": msg_time_ms, "end": msg_time_ms + 500},
-            "id": generate_id("prt", "{}-{}-text".format(session_id, line_index)),
+            "id": generate_sortable_id("prt", msg_time_ms, part_seq, "{}-{}-text".format(session_id, line_index)),
             "sessionID": session_id,
             "messageID": msg_id,
         })
+        part_seq += 1
 
     # Tool parts
     for ti, tool in enumerate(tool_calls):
@@ -382,10 +410,11 @@ def convert_line(
                 "time": {"start": msg_time_ms + 100, "end": msg_time_ms + 500},
             },
             "metadata": {"cursor": {"original_tool": tool.get("name", "unknown")}},
-            "id": generate_id("prt", "{}-{}-tool-{}".format(session_id, line_index, ti)),
+            "id": generate_sortable_id("prt", msg_time_ms, part_seq, "{}-{}-tool-{}".format(session_id, line_index, ti)),
             "sessionID": session_id,
             "messageID": msg_id,
         })
+        part_seq += 1
 
     # Step finish
     finish_reason = "tool-calls" if tool_calls else "stop"
@@ -397,7 +426,7 @@ def convert_line(
             "cache": {"write": 0, "read": 0},
         },
         "cost": 0,
-        "id": generate_id("prt", "{}-{}-finish".format(session_id, line_index)),
+        "id": generate_sortable_id("prt", msg_time_ms, part_seq, "{}-{}-finish".format(session_id, line_index)),
         "sessionID": session_id,
         "messageID": msg_id,
     })
@@ -405,6 +434,7 @@ def convert_line(
     return [{
         "info": make_asst_info(
             msg_id, session_id, parent_msg_id, msg_time_ms, finish=finish_reason,
+            working_dir=working_dir,
         ),
         "parts": parts,
     }]
@@ -469,14 +499,15 @@ def convert_conversation(
     # subagent-only), synthesize a placeholder user message.
     first_role = lines[0]["role"] if lines else "assistant"
     if first_role != "user":
-        synth_id = generate_id("msg", "{}-synthetic-user".format(session_id))
+        synth_id = generate_sortable_id("msg", base_time_ms - 1, 0, "{}-synthetic-user".format(session_id))
         all_messages.append(
             make_user_msg(session_id, synth_id, "[Background agent tasks]", base_time_ms - 1)
         )
         last_user_msg_id = synth_id
 
     for i, line in enumerate(lines):
-        msgs = convert_line(line, session_id, last_user_msg_id, i, base_time_ms)
+        msgs = convert_line(line, session_id, last_user_msg_id, i, base_time_ms,
+                            working_dir=working_dir)
         for m in msgs:
             if m["info"]["role"] == "user":
                 last_user_msg_id = m["info"]["id"]
@@ -497,7 +528,7 @@ def convert_conversation(
             sep_time = base_time_ms + (offset * 1000)
 
             # Start separator
-            sep_msg_id = generate_id("msg", "{}-subagent-{}-sep".format(session_id, sa_id))
+            sep_msg_id = generate_sortable_id("msg", sep_time, 0, "{}-subagent-{}-sep".format(session_id, sa_id))
             all_messages.append(make_text_separator(
                 session_id, sep_msg_id, last_user_msg_id,
                 "---\n\n**[Subagent: {}]** (ID: `{}`)\n\n---".format(sa_title, sa_id),
@@ -509,6 +540,7 @@ def convert_conversation(
             for j, sa_line in enumerate(sa_lines):
                 sa_msgs = convert_line(
                     sa_line, session_id, sa_last_user_id, offset + j + 1, base_time_ms,
+                    working_dir=working_dir,
                 )
                 for m in sa_msgs:
                     if m["info"]["role"] == "user":
@@ -518,7 +550,7 @@ def convert_conversation(
             # End separator
             end_offset = offset + len(sa_lines) + 2
             end_time = base_time_ms + (end_offset * 1000)
-            end_msg_id = generate_id("msg", "{}-subagent-{}-end".format(session_id, sa_id))
+            end_msg_id = generate_sortable_id("msg", end_time, 0, "{}-subagent-{}-end".format(session_id, sa_id))
             all_messages.append(make_text_separator(
                 session_id, end_msg_id, sa_last_user_id,
                 "---\n\n**[End of subagent: {}]**\n\n---".format(sa_title),
@@ -609,8 +641,64 @@ def strip_ansi(text: str) -> str:
 # Import
 # ---------------------------------------------------------------------------
 
+def find_opencode_db() -> Optional[Path]:
+    """Locate the OpenCode SQLite database."""
+    candidates = [
+        Path.home() / ".local" / "share" / "opencode" / "opencode.db",
+        Path(os.environ.get("XDG_DATA_HOME", "")) / "opencode" / "opencode.db",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def delete_session_from_db(session_id: str) -> bool:
+    """
+    Delete an existing session and all its messages/parts from the OpenCode
+    database. This ensures re-imports are clean and don't accumulate stale
+    parts from previous imports with different ID schemes.
+
+    We delete explicitly (parts → messages → session) because SQLite does
+    not enforce foreign key cascades by default.
+    """
+    db_path = find_opencode_db()
+    if not db_path:
+        return False
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        # Delete in dependency order: parts → messages → session
+        conn.execute("DELETE FROM part WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM message WHERE session_id = ?", (session_id,))
+        cursor = conn.execute("DELETE FROM session WHERE id = ?", (session_id,))
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        conn.close()
+        if deleted:
+            print("  Cleaned up previous import: {}".format(session_id), file=sys.stderr)
+        return deleted
+    except Exception as e:
+        print("  Warning: could not clean up old session: {}".format(e), file=sys.stderr)
+        return False
+
+
 def import_file(filepath: Path) -> bool:
-    """Import a single JSON file into OpenCode. Returns True on success."""
+    """Import a single JSON file into OpenCode.
+
+    Before importing, deletes any existing session with the same ID to avoid
+    accumulating stale parts from previous imports. Returns True on success.
+    """
+    # Read the session ID from the JSON file so we can clean up first
+    try:
+        with open(filepath, encoding="utf-8") as f:
+            data = json.load(f)
+        session_id = data.get("info", {}).get("id", "")
+        if session_id:
+            delete_session_from_db(session_id)
+    except Exception:
+        pass  # Best-effort cleanup; import may still succeed
+
     result = subprocess.run(
         ["opencode", "import", str(filepath)],
         capture_output=True, text=True,
